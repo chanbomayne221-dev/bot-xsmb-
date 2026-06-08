@@ -427,7 +427,7 @@ async def menu_text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     elif text == BTN_SUPPORT:
         await update.message.reply_text(
-            f"🆘 Hỗ trợ: tham gia room {ROOM_TX_URL}",
+            f"🆘 Hỗ trợ: @huybuwin/ntham gia room {ROOM_TX_URL}",
             reply_markup=main_menu_kb(),
         )
     # text khác: bỏ qua, không spam người dùng
