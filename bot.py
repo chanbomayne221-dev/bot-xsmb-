@@ -248,9 +248,9 @@ def format_xsmb(data: dict) -> str:
 
 # ------------------------------------------------------------------ Menus
 # Nhãn bàn phím chính (reply keyboard - hiện ngay dưới ô gõ tin)
-BTN_PLAY     = "🎮 Đánh Lô Đề"
-BTN_XSMB     = "🎯 Xem KQXS"
 BTN_ACCOUNT  = "👤 Tài Khoản"
+BTN_XSMB     = "🎯 Xem KQXS"
+BTN_PLAY     = "🎮 Đánh Lô Đề"
 BTN_DEPOSIT  = "💳 Nạp Tiền"
 BTN_WITHDRAW = "💸 Rút Tiền"
 BTN_SUPPORT  = "🆘 Hỗ Trợ"
