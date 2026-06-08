@@ -251,8 +251,8 @@ def format_xsmb(data: dict) -> str:
 BTN_PLAY     = "🎮 Đánh Lô Đề"
 BTN_XSMB     = "🎯 Xem KQXS"
 BTN_ACCOUNT  = "👤 Tài Khoản"
-BTN_DEPOSIT  = "💳 Nạp (Demo)"
-BTN_WITHDRAW = "💸 Rút (Demo)"
+BTN_DEPOSIT  = "💳 Nạp Tiền"
+BTN_WITHDRAW = "💸 Rút Tiền"
 BTN_SUPPORT  = "🆘 Hỗ Trợ"
 
 def main_menu_kb() -> ReplyKeyboardMarkup:
@@ -273,8 +273,8 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 def account_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📜 Lịch sử chơi", callback_data="hist_bet")],
-        [InlineKeyboardButton("💳 Lịch sử nạp demo", callback_data="hist_dep"),
-         InlineKeyboardButton("💸 Lịch sử rút demo", callback_data="hist_wd")],
+        [InlineKeyboardButton("💳 Lịch sử nạp ", callback_data="hist_dep"),
+         InlineKeyboardButton("💸 Lịch sử rút ", callback_data="hist_wd")],
     ])
 
 
