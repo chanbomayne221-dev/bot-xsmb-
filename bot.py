@@ -7,23 +7,47 @@ import re
 import logging
 import asyncio
 import sys
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time as dtime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore
 
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+# Giờ công bố KQXS miền Bắc (18:35 VN). Trước giờ này hiển thị KQ hôm qua.
+RESULT_TIME_VN = dtime(18, 35, tzinfo=VN_TZ)
+
+def vn_now() -> datetime:
+    return datetime.now(VN_TZ)
+
+def vn_today() -> date:
+    return vn_now().date()
+
+def latest_result_date() -> date:
+    """Trả về ngày kết quả mới nhất hiện có. Sau 18:35 VN -> hôm nay, trước -> hôm qua."""
+    now = vn_now()
+    cutoff = now.replace(hour=18, minute=35, second=0, microsecond=0)
+    return now.date() if now >= cutoff else (now.date() - timedelta(days=1))
+
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 import database as db
@@ -61,23 +85,70 @@ POINT_VALUE = {
 
 # ------------------------------------------------------------------ XSMB
 def _today_str() -> str:
-    return date.today().isoformat()
+    return vn_today().isoformat()
 
 
-def fetch_xsmb(d: date | None = None) -> dict | None:
-    """Scrape kết quả XSMB từ xskt.com.vn. Trả về dict hoặc None."""
-    d = d or date.today()
-    log.info("Đang lấy KQXS ngày %s", d.isoformat())
-    cached = db.get_xsmb(d.isoformat())
-    if cached and cached["all_numbers"]:
-        return {
-            "date": d.isoformat(),
-            "special": cached["special"],
-            "all_numbers": cached["all_numbers"].split(","),
-            "cached": True,
-        }
+# Thứ tự + nhãn các giải XSMB (chuẩn 27 giải)
+PRIZE_ORDER = [
+    ("special", "🏆 Đặc Biệt", 1),
+    ("g1",      "🥇 Giải nhất", 1),
+    ("g2",      "🥈 Giải nhì", 2),
+    ("g3",      "🥉 Giải ba", 6),
+    ("g4",      "🎖 Giải tư", 4),
+    ("g5",      "🎯 Giải năm", 6),
+    ("g6",      "🎲 Giải sáu", 3),
+    ("g7",      "🍀 Giải bảy", 4),
+]
+# Map nhãn HTML tiếng Việt -> key
+LABEL_MAP = {
+    "đặc biệt": "special", "giải đặc biệt": "special", "đb": "special", "db": "special",
+    "giải nhất": "g1", "nhất": "g1", "g1": "g1",
+    "giải nhì": "g2", "nhì": "g2", "g2": "g2",
+    "giải ba": "g3", "ba": "g3", "g3": "g3",
+    "giải tư": "g4", "tư": "g4", "g4": "g4",
+    "giải năm": "g5", "năm": "g5", "g5": "g5",
+    "giải sáu": "g6", "sáu": "g6", "g6": "g6",
+    "giải bảy": "g7", "bảy": "g7", "g7": "g7",
+}
 
-    url = "https://xskt.com.vn/xsmb"
+
+def _empty_prizes() -> dict:
+    return {key: [] for key, _, _ in PRIZE_ORDER}
+
+
+def fetch_xsmb(d: date | None = None, force: bool = False) -> dict | None:
+    """Scrape kết quả XSMB từ xskt.com.vn theo từng giải, cho ngày `d`."""
+    d = d or latest_result_date()
+    log.info("Đang lấy KQXS ngày %s (force=%s)", d.isoformat(), force)
+
+    # Có cache thì dùng (trừ khi force refresh)
+    if not force:
+        cached = db.get_xsmb(d.isoformat())
+        if cached and cached.get("all_numbers"):
+            import json
+            prizes_raw = cached.get("raw_json")
+            prizes = None
+            if prizes_raw:
+                try:
+                    prizes = json.loads(prizes_raw)
+                except Exception:
+                    prizes = None
+            # Chỉ dùng cache nếu có đủ prizes (đã lưu kiểu mới)
+            if prizes and prizes.get("special"):
+                return {
+                    "date": d.isoformat(),
+                    "special": cached["special"],
+                    "all_numbers": cached["all_numbers"].split(",") if isinstance(cached["all_numbers"], str) else cached["all_numbers"],
+                    "prizes": prizes,
+                    "cached": True,
+                }
+
+    # URL theo ngày: /xsmb/dd-mm-yyyy ; nếu là hôm nay dùng URL gốc cho chắc
+    if d == vn_today():
+        url = "https://xskt.com.vn/xsmb"
+    else:
+        url = f"https://xskt.com.vn/xsmb/{d.strftime('%d-%m-%Y')}"
+
     try:
         r = requests.get(
             url,
@@ -94,65 +165,109 @@ def fetch_xsmb(d: date | None = None) -> dict | None:
     if not table:
         return None
 
-    # lấy tất cả số trong bảng
-    numbers = []
-    special = ""
+    prizes = _empty_prizes()
     for row in table.find_all("tr"):
         cells = row.find_all(["td", "th"])
-        if not cells:
+        if len(cells) < 2:
             continue
-        label = cells[0].get_text(strip=True).lower()
-        for cell in cells[1:]:
-            txt = cell.get_text(" ", strip=True)
-            for n in re.findall(r"\d+", txt):
-                numbers.append(n)
-                if "đặc biệt" in label and not special:
-                    special = n
+        label = re.sub(r"\s+", " ", cells[0].get_text(" ", strip=True)).lower().strip(": ")
+        key = LABEL_MAP.get(label)
+        if not key:
+            # đôi khi label kèm "DB" / "ĐB"
+            if "đặc biệt" in label or label in ("db", "đb"):
+                key = "special"
+            else:
+                continue
+        # Chỉ lấy cột giải (cell[1]). Bỏ qua các cột đầu/đuôi.
+        txt = cells[1].get_text(" ", strip=True)
+        for n in re.findall(r"\d{2,6}", txt):
+            prizes[key].append(n)
 
-    if not numbers:
+    if not prizes["special"]:
+        log.warning("Không parse được giải đặc biệt cho ngày %s", d)
         return None
 
-    # 2 số cuối
-    last2 = [n[-2:].zfill(2) for n in numbers if len(n) >= 2]
-    db.save_xsmb(d.isoformat(), special, last2)
+    # 2 số cuối tất cả các giải -> phục vụ đối chiếu lô/xiên
+    all_numbers = [n for key, _, _ in PRIZE_ORDER for n in prizes[key]]
+    last2 = [n[-2:].zfill(2) for n in all_numbers if len(n) >= 2]
+
+    import json as _json
+    db.save_xsmb(d.isoformat(), prizes["special"][0], last2, raw_json=_json.dumps(prizes))
+
     return {
         "date": d.isoformat(),
-        "special": special,
+        "special": prizes["special"][0],
         "all_numbers": last2,
+        "prizes": prizes,
         "cached": False,
     }
 
 
+def _fmt_date_vn(iso: str) -> str:
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        return iso
+
+
 def format_xsmb(data: dict) -> str:
-    nums = data["all_numbers"]
+    """Định dạng HTML (in đậm) đẹp như khách yêu cầu."""
+    prizes = data.get("prizes") or {}
     lines = [
-        f"🎯 *KẾT QUẢ XSMB - {data['date']}*",
-        "━━━━━━━━━━━━━━━━━━━",
-        f"🏆 *ĐB:* `{data.get('special','--')}`",
-        "━━━━━━━━━━━━━━━━━━━",
-        "📋 *2 số cuối (27 giải):*",
+        "🎯 <b>KẾT QUẢ XỔ SỐ MIỀN BẮC</b>",
+        "",
+        f"📅 <b>Ngày:</b> {_fmt_date_vn(data['date'])}",
+        "",
+        "-------------------------",
+        "",
     ]
-    # chia 5 cột
-    row = []
-    for i, n in enumerate(nums, 1):
-        row.append(f"`{n}`")
-        if i % 5 == 0:
-            lines.append("  ".join(row))
-            row = []
-    if row:
-        lines.append("  ".join(row))
+
+    # Số cột mỗi giải khi xuống dòng
+    cols = {"special": 1, "g1": 1, "g2": 2, "g3": 3, "g4": 4, "g5": 3, "g6": 3, "g7": 4}
+
+    for key, label, _expected in PRIZE_ORDER:
+        nums = prizes.get(key) or []
+        if not nums:
+            continue
+        if key == "special":
+            lines.append(f"{label}:  <b>{nums[0]}</b>")
+            lines.append("")
+            continue
+        lines.append(f"{label}:")
+        per = cols.get(key, 3)
+        for i in range(0, len(nums), per):
+            chunk = nums[i:i + per]
+            lines.append(" - ".join(f"<b>{n}</b>" for n in chunk))
+        lines.append("")
+
+    lines.append("-------------------------")
+    lines.append("")
+    lines.append("🤖 <i>Cập nhật tự động XSMB hôm nay</i>")
     return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ Menus
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎮 Đánh Lô Đề", callback_data="menu_play")],
-        [InlineKeyboardButton("👤 Tài Khoản", callback_data="menu_account")],
-        [InlineKeyboardButton("💳 Nạp (Demo)", callback_data="menu_deposit"),
-         InlineKeyboardButton("💸 Rút (Demo)", callback_data="menu_withdraw")],
-        [InlineKeyboardButton("🆘 Hỗ Trợ", callback_data="menu_support")],
-    ])
+# Nhãn bàn phím chính (reply keyboard - hiện ngay dưới ô gõ tin)
+BTN_PLAY     = "🎮 Đánh Lô Đề"
+BTN_XSMB     = "🎯 Xem KQXS"
+BTN_ACCOUNT  = "👤 Tài Khoản"
+BTN_DEPOSIT  = "💳 Nạp (Demo)"
+BTN_WITHDRAW = "💸 Rút (Demo)"
+BTN_SUPPORT  = "🆘 Hỗ Trợ"
+
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    """Bàn phím chính - hiện cố định dưới ô chat."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_XSMB), KeyboardButton(BTN_PLAY)],
+            [KeyboardButton(BTN_ACCOUNT)],
+            [KeyboardButton(BTN_DEPOSIT), KeyboardButton(BTN_WITHDRAW)],
+            [KeyboardButton(BTN_SUPPORT)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Chọn chức năng…",
+    )
 
 
 def account_menu_kb() -> InlineKeyboardMarkup:
@@ -160,7 +275,6 @@ def account_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📜 Lịch sử chơi", callback_data="hist_bet")],
         [InlineKeyboardButton("💳 Lịch sử nạp demo", callback_data="hist_dep"),
          InlineKeyboardButton("💸 Lịch sử rút demo", callback_data="hist_wd")],
-        [InlineKeyboardButton("⬅️ Về menu", callback_data="back_main")],
     ])
 
 
@@ -182,13 +296,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_xsmb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     log.info("Nhận /xsmb từ user_id=%s", update.effective_user.id if update.effective_user else "unknown")
     await update.message.chat.send_action("typing")
-    data = fetch_xsmb()
+    data = fetch_xsmb()  # tự chọn ngày hợp lệ theo giờ VN
     if not data:
-        await update.message.reply_text("⚠️ Chưa lấy được KQXS hôm nay, thử lại sau.")
+        await update.message.reply_text(
+            "⚠️ Chưa lấy được KQXS, thử lại sau nhé.",
+            reply_markup=main_menu_kb(),
+        )
         return
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎮 Đánh đề", callback_data="menu_play")]])
     await update.message.reply_text(
-        format_xsmb(data), parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+        format_xsmb(data),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=main_menu_kb(),
     )
 
 
@@ -283,6 +402,35 @@ async def send_account(message, user_id: int):
     await message.reply_text(
         txt, parse_mode=ParseMode.MARKDOWN, reply_markup=account_menu_kb()
     )
+
+
+# ----- Bàn phím chính: bắt text từ reply keyboard -----
+async def menu_text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    u = update.effective_user
+    db.get_or_create_user(u.id, u.username)
+
+    if text == BTN_XSMB:
+        await cmd_xsmb(update, ctx)
+    elif text == BTN_PLAY:
+        await update.message.reply_text(
+            HELP_PLAY, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb()
+        )
+    elif text == BTN_ACCOUNT:
+        await send_account(update.message, u.id)
+    elif text in (BTN_DEPOSIT, BTN_WITHDRAW):
+        await update.message.reply_text(
+            "💎 *Đây là chế độ DEMO*\nChưa hỗ trợ nạp/rút thật.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb(),
+        )
+    elif text == BTN_SUPPORT:
+        await update.message.reply_text(
+            f"🆘 Hỗ trợ: tham gia room {ROOM_TX_URL}",
+            reply_markup=main_menu_kb(),
+        )
+    # text khác: bỏ qua, không spam người dùng
 
 
 # ----------------- bet commands -----------------
@@ -424,20 +572,49 @@ async def settle_for_date(app: Application, d: date):
 
 
 async def settle_job(ctx: ContextTypes.DEFAULT_TYPE):
-    await settle_for_date(ctx.application, date.today())
+    today = vn_today()
+    await settle_for_date(ctx.application, today)
     # cả hôm qua phòng khi chậm
-    await settle_for_date(ctx.application, date.today() - timedelta(days=1))
+    await settle_for_date(ctx.application, today - timedelta(days=1))
+
+
+async def refresh_xsmb_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Job chạy 18:35 (giờ VN) mỗi ngày để refresh KQXS mới nhất.
+    Cũng được lặp lại mỗi 5 phút sau đó cho tới khi có kết quả mới."""
+    d = vn_today()
+    log.info("[refresh_xsmb_job] tải KQXS %s (force)", d)
+    data = fetch_xsmb(d, force=True)
+    if data:
+        log.info("[refresh_xsmb_job] OK - ĐB %s", data["special"])
+    else:
+        log.info("[refresh_xsmb_job] chưa có KQ, sẽ thử lại lần sau.")
 
 
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
-    log.exception("Lỗi khi xử lý update: %s", update, exc_info=ctx.error)
+    err = ctx.error
+    # Nhận diện lỗi Conflict: 2 instance cùng long-polling 1 bot token
+    msg = str(err) if err else ""
+    if "Conflict" in msg and "getUpdates" in msg:
+        log.error(
+            "❌ XUNG ĐỘT INSTANCE: Có bot khác đang chạy cùng BOT_TOKEN này.\n"
+            "👉 Vào Render kiểm tra: CHỈ giữ duy nhất 1 service (Background Worker) "
+            "đang chạy. Tắt mọi service/worker khác đang dùng cùng token, "
+            "hoặc tạo bot mới qua @BotFather và thay BOT_TOKEN."
+        )
+        return
+    log.exception("Lỗi khi xử lý update: %s", update, exc_info=err)
 
 
 async def post_init(app: Application):
     me = await app.bot.get_me()
     log.info("Đã kết nối Telegram: @%s (id=%s)", me.username, me.id)
-    # Xóa webhook cũ nếu trước đó từng deploy kiểu webhook; long polling cần bước này.
-    await app.bot.delete_webhook(drop_pending_updates=True)
+    # Xóa webhook + drop update cũ để tránh xung đột với instance trước.
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        log.warning("delete_webhook lỗi (bỏ qua): %s", e)
+    # Chờ 3 giây cho instance cũ (nếu có) nhả getUpdates trước khi mình poll.
+    await asyncio.sleep(3)
     log.info("Đã bật long polling. Hãy nhắn /start hoặc /xsmb cho @%s", me.username)
 
 
@@ -470,11 +647,32 @@ def main():
     app.add_handler(CommandHandler("xienba", cmd_xienba))
     app.add_handler(CommandHandler("xienbon", cmd_xienbon))
     app.add_handler(CallbackQueryHandler(cb_handler))
+    # Bàn phím chính: text từ reply keyboard
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler))
     app.add_error_handler(error_handler)
 
     # job đối chiếu mỗi 5 phút
     if app.job_queue:
         app.job_queue.run_repeating(settle_job, interval=300, first=30)
+        # Refresh KQXS đúng 18:35 (giờ VN) mỗi ngày
+        app.job_queue.run_daily(
+            refresh_xsmb_job,
+            time=dtime(18, 35, tzinfo=VN_TZ),
+            name="refresh_xsmb_1835",
+        )
+        # Thử lại mỗi 5 phút từ 18:35 -> 19:30 phòng khi server XSMB chậm
+        for mm in (40, 45, 50, 55):
+            app.job_queue.run_daily(
+                refresh_xsmb_job,
+                time=dtime(18, mm, tzinfo=VN_TZ),
+                name=f"refresh_xsmb_18{mm}",
+            )
+        for mm in (0, 10, 20, 30):
+            app.job_queue.run_daily(
+                refresh_xsmb_job,
+                time=dtime(19, mm, tzinfo=VN_TZ),
+                name=f"refresh_xsmb_19{mm:02d}",
+            )
 
     log.info("Bot khởi động (long polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
