@@ -6,6 +6,7 @@ import os
 import re
 import logging
 import asyncio
+import sys
 from datetime import datetime, date, timedelta
 
 import requests
@@ -35,6 +36,8 @@ ROOM_TX_URL = os.getenv("ROOM_TX_URL", "https://t.me/xombaoref")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
 )
 log = logging.getLogger("lode-bot")
 
@@ -64,6 +67,7 @@ def _today_str() -> str:
 def fetch_xsmb(d: date | None = None) -> dict | None:
     """Scrape kết quả XSMB từ xskt.com.vn. Trả về dict hoặc None."""
     d = d or date.today()
+    log.info("Đang lấy KQXS ngày %s", d.isoformat())
     cached = db.get_xsmb(d.isoformat())
     if cached and cached["all_numbers"]:
         return {
@@ -77,8 +81,8 @@ def fetch_xsmb(d: date | None = None) -> dict | None:
     try:
         r = requests.get(
             url,
-            headers={"User-Agent": "Mozilla/5.0 (lode-bot)"},
-            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 lode-demo-bot"},
+            timeout=20,
         )
         r.raise_for_status()
     except Exception as e:
@@ -162,6 +166,7 @@ def account_menu_kb() -> InlineKeyboardMarkup:
 
 # ------------------------------------------------------------------ handlers
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    log.info("Nhận /start từ user_id=%s", update.effective_user.id if update.effective_user else "unknown")
     u = update.effective_user
     db.get_or_create_user(u.id, u.username)
     txt = (
@@ -175,6 +180,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_xsmb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    log.info("Nhận /xsmb từ user_id=%s", update.effective_user.id if update.effective_user else "unknown")
     await update.message.chat.send_action("typing")
     data = fetch_xsmb()
     if not data:
@@ -423,13 +429,26 @@ async def settle_job(ctx: ContextTypes.DEFAULT_TYPE):
     await settle_for_date(ctx.application, date.today() - timedelta(days=1))
 
 
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    log.exception("Lỗi khi xử lý update: %s", update, exc_info=ctx.error)
+
+
+async def post_init(app: Application):
+    me = await app.bot.get_me()
+    log.info("Đã kết nối Telegram: @%s (id=%s)", me.username, me.id)
+    # Xóa webhook cũ nếu trước đó từng deploy kiểu webhook; long polling cần bước này.
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    log.info("Đã bật long polling. Hãy nhắn /start hoặc /xsmb cho @%s", me.username)
+
+
 # ------------------------------------------------------------------ main
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Thiếu BOT_TOKEN trong biến môi trường.")
     db.init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    log.info("Khởi động bot với Python %s", sys.version.split()[0])
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("xsmb", cmd_xsmb))
@@ -439,13 +458,14 @@ def main():
     app.add_handler(CommandHandler("xienba", cmd_xienba))
     app.add_handler(CommandHandler("xienbon", cmd_xienbon))
     app.add_handler(CallbackQueryHandler(cb_handler))
+    app.add_error_handler(error_handler)
 
     # job đối chiếu mỗi 5 phút
     if app.job_queue:
         app.job_queue.run_repeating(settle_job, interval=300, first=30)
 
     log.info("Bot khởi động (long polling)...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
