@@ -47,7 +47,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 # Sửa BOT_TOKEN trong .env
-python bot.py
+python -u bot.py
 ```
 
 ---
@@ -67,7 +67,7 @@ python bot.py
 - New → **Background Worker**
 - Runtime: **Python 3**
 - Build command: `pip install -r requirements.txt`
-- Start command: `python bot.py`
+- Start command: `python -u bot.py`
 - Env vars:
   - `BOT_TOKEN` = token bot
   - `ROOM_TX_URL` = `https://t.me/xombaoref`

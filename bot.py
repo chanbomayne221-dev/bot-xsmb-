@@ -442,10 +442,22 @@ async def post_init(app: Application):
 
 
 # ------------------------------------------------------------------ main
+def _ensure_event_loop():
+    """Python 3.12+ không tự tạo event loop cho MainThread.
+    PTB <22 gọi asyncio.get_event_loop() và sẽ raise RuntimeError.
+    Hàm này đảm bảo luôn có 1 loop khả dụng."""
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Thiếu BOT_TOKEN trong biến môi trường.")
     db.init_db()
+    _ensure_event_loop()
 
     log.info("Khởi động bot với Python %s", sys.version.split()[0])
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
