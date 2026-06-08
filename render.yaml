@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: lode-telegram-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ROOM_TX_URL
+        value: https://t.me/xombaoref
+      - key: DB_PATH
+        value: lode.db
